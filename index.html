@@ -127,6 +127,19 @@
   .shiny-glow{animation:shimmer 1.6s ease-in-out infinite;}
   @keyframes shimmer{0%,100%{filter:brightness(1)}50%{filter:brightness(1.4) saturate(1.3)}}
   @media (prefers-reduced-motion: reduce){*{animation-duration:.01ms !important;} .laserline.sweep,.laserline.sweep2{animation:none; opacity:0;}}
+
+  /* ---- live camera barcode scanner ---- */
+  .btn.cam{background:linear-gradient(180deg,#2f7dff,#1848b8); border-color:rgba(130,170,255,.45); width:100%;}
+  .cam-overlay{position:absolute; inset:0; z-index:50; display:none; flex-direction:column; padding:10px; background:rgba(4,6,10,.97); border-radius:8px;}
+  .cam-overlay.show{display:flex;}
+  .cam-frame{position:relative; flex:1; min-height:0; border-radius:8px; overflow:hidden; background:#000; display:flex; align-items:center; justify-content:center;}
+  #cam-video{width:100%; height:100%; object-fit:cover;}
+  .cam-reticle{position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none;}
+  .cam-reticle .box{position:relative; width:82%; height:38%; border:2px solid var(--amber); border-radius:10px; box-shadow:0 0 0 100vmax rgba(0,0,0,.42);}
+  .cam-reticle .box::before{content:""; position:absolute; left:5%; right:5%; height:2px; top:8%; background:var(--laser); box-shadow:0 0 10px var(--laser); animation:camscan 1.8s ease-in-out infinite;}
+  @keyframes camscan{0%{top:8%}50%{top:90%}100%{top:8%}}
+  .cam-status{position:absolute; left:8px; right:8px; bottom:8px; text-align:center; font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:.5px; color:var(--bone); background:rgba(0,0,0,.55); padding:6px 8px; border-radius:6px; line-height:1.4;}
+  .cam-cancel{margin-top:10px;}
 </style>
 </head>
 <body>
@@ -815,15 +828,147 @@ function typeOut(text){clearInterval(typerTimer);readout.textContent='';let i=0;
 /* ---------- SCAN ---------- */
 function renderScanControls(){
   $('#context-controls').innerHTML=`
-    <div class="scan-input-row"><input class="code-input" id="code-input" inputmode="text" placeholder="ENTER CODE…" maxlength="24" autocomplete="off"></div>
+    <div class="scan-input-row">
+      <button class="btn cam" id="camera-btn">▣ SCAN ITEM WITH CAMERA</button>
+    </div>
+    <div class="scan-input-row" style="margin-top:8px;"><input class="code-input" id="code-input" inputmode="text" placeholder="…OR TYPE A CODE" maxlength="24" autocomplete="off"></div>
     <div class="scan-input-row" style="margin-top:8px;">
-      <button class="btn scan" id="scan-btn" style="flex:2;">◗ SCAN</button>
+      <button class="btn scan" id="scan-btn" style="flex:2;">◗ SCAN CODE</button>
       <button class="btn ghost" id="random-btn" style="flex:1;">RANDOM</button>
     </div>`;
+  $('#camera-btn').onclick=()=>startCamera();
   $('#scan-btn').onclick=()=>{const v=$('#code-input').value.trim();if(!v){typeOut('ERR: NO CODE ENTERED.');return;}doScan(v);};
   $('#random-btn').onclick=()=>{const rc=String(Math.floor(Math.random()*9e11)+1e11);$('#code-input').value=rc;doScan(rc);};
   $('#code-input').addEventListener('keydown',e=>{if(e.key==='Enter')$('#scan-btn').click();});
 }
+
+/* ---------- LIVE CAMERA BARCODE SCANNER ----------
+   Reads a real barcode off a physical item, then feeds the number into
+   the same doScan() the typed path uses. Uses the browser's native
+   BarcodeDetector when present (Android/Chrome); otherwise loads the
+   ZXing library as a fallback (iPhone/Safari and others). */
+const CAM_FORMATS=['ean_13','ean_8','upc_a','upc_e','code_128','code_39','code_93','codabar','itf','qr_code','data_matrix'];
+const ZXING_SRC='https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js';
+const cam={active:false,mode:null,raf:null,stream:null,reader:null,controls:null};
+
+function ensureCamDom(){
+  if($('#cam-overlay'))return;
+  const ov=document.createElement('div');
+  ov.id='cam-overlay';ov.className='cam-overlay';
+  ov.innerHTML=`
+    <div class="cam-frame">
+      <video id="cam-video" playsinline muted autoplay></video>
+      <div class="cam-reticle"><div class="box"></div></div>
+      <div class="cam-status" id="cam-status">STARTING CAMERA…</div>
+    </div>
+    <button class="btn ghost cam-cancel" id="cam-cancel">✕ CANCEL</button>`;
+  $('#screen').appendChild(ov);
+  $('#cam-cancel').onclick=()=>stopCamera('SCAN CANCELLED.');
+}
+function camStatus(t){const el=$('#cam-status');if(el)el.textContent=t;}
+
+async function startCamera(){
+  if(cam.active)return;
+  ensureCamDom();
+  cam.active=true;cam.mode=null;
+  $('#cam-overlay').classList.add('show');
+  const video=$('#cam-video');
+  camStatus('STARTING CAMERA…');
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||!window.isSecureContext){
+    camStatus('CAMERA NEEDS A SECURE (HTTPS) PAGE AND A SUPPORTED BROWSER. TYPE THE NUMBER UNDER THE BARCODE INSTEAD.');
+    return;
+  }
+  // Native BarcodeDetector path (fast; Android/Chrome)
+  let det=null;
+  if('BarcodeDetector' in window){
+    try{
+      const sup=await window.BarcodeDetector.getSupportedFormats();
+      const use=CAM_FORMATS.filter(f=>sup.includes(f));
+      if(use.length)det=new window.BarcodeDetector({formats:use});
+    }catch(e){}
+  }
+  if(det){
+    try{
+      cam.stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+    }catch(err){return camError(err);}
+    if(!cam.active){stopCamera();return;}
+    video.srcObject=cam.stream;
+    try{await video.play();}catch(e){}
+    cam.mode='native';
+    camStatus('POINT AT A BARCODE');
+    const tick=async()=>{
+      if(!cam.active||cam.mode!=='native')return;
+      try{const found=await det.detect(video);if(found&&found.length&&found[0].rawValue){return onBarcode(found[0].rawValue);}}catch(e){}
+      cam.raf=requestAnimationFrame(tick);
+    };
+    cam.raf=requestAnimationFrame(tick);
+    return;
+  }
+  // Fallback: ZXing library
+  camStatus('LOADING SCANNER…');
+  try{await loadZXing();}
+  catch(e){camStatus('SCANNER COULD NOT LOAD (CHECK YOUR INTERNET). TYPE THE NUMBER INSTEAD.');return;}
+  if(!cam.active)return;
+  try{
+    cam.reader=new window.ZXing.BrowserMultiFormatReader();
+    cam.mode='zxing';
+    camStatus('POINT AT A BARCODE');
+    const controls=await cam.reader.decodeFromConstraints({video:{facingMode:{ideal:'environment'}},audio:false},video,(result)=>{
+      if(result&&cam.active)onBarcode(result.getText());
+    });
+    cam.controls=controls;
+    if(!cam.active){stopCamera();}
+  }catch(err){camError(err);}
+}
+
+function loadZXing(){
+  if(window.ZXing&&window.ZXing.BrowserMultiFormatReader)return Promise.resolve();
+  if(cam._zxload)return cam._zxload;
+  cam._zxload=new Promise((res,rej)=>{
+    const s=document.createElement('script');
+    s.src=ZXING_SRC;s.async=true;
+    s.onload=()=>res();s.onerror=()=>{cam._zxload=null;rej(new Error('zxing load failed'));};
+    document.head.appendChild(s);
+  });
+  return cam._zxload;
+}
+
+function camError(err){
+  const n=err&&err.name;
+  if(n==='NotAllowedError'||n==='SecurityError')camStatus('CAMERA BLOCKED. ALLOW CAMERA ACCESS FOR THIS PAGE, THEN TAP AGAIN.');
+  else if(n==='NotFoundError'||n==='OverconstrainedError'||n==='DevicesNotFoundError')camStatus('NO USABLE CAMERA FOUND ON THIS DEVICE.');
+  else if(n==='NotReadableError'||n==='TrackStartError')camStatus('CAMERA IS BUSY IN ANOTHER APP. CLOSE IT AND TRY AGAIN.');
+  else camStatus('COULD NOT START THE CAMERA. TYPE THE NUMBER INSTEAD.');
+}
+
+function stopCamera(msg){
+  cam.active=false;cam.mode=null;
+  if(cam.raf){cancelAnimationFrame(cam.raf);cam.raf=null;}
+  if(cam.controls){try{cam.controls.stop();}catch(e){}cam.controls=null;}
+  if(cam.reader){try{cam.reader.reset();}catch(e){}cam.reader=null;}
+  const v=$('#cam-video');
+  try{const s=v&&v.srcObject;if(s&&s.getTracks)s.getTracks().forEach(t=>t.stop());}catch(e){}
+  if(cam.stream){try{cam.stream.getTracks().forEach(t=>t.stop());}catch(e){}cam.stream=null;}
+  if(v)v.srcObject=null;
+  const ov=$('#cam-overlay');if(ov)ov.classList.remove('show');
+  if(msg)typeOut(msg);
+}
+
+let lastBarcode={code:null,t:0};
+function onBarcode(value){
+  if(!cam.active)return;
+  const code=String(value).trim();
+  if(!code)return;
+  const now=Date.now();
+  if(code===lastBarcode.code&&now-lastBarcode.t<2500)return; // debounce repeats
+  lastBarcode={code,t:now};
+  try{if(navigator.vibrate)navigator.vibrate(60);}catch(e){}
+  stopCamera();
+  const input=$('#code-input');if(input)input.value=code;
+  typeOut('BARCODE LOCKED ▍ '+code);
+  doScan(code);
+}
+
 function doScan(code){
   const stage=$('#scan-stage');const c=scan(code);state.current=c;
   const hi=isHi(c);
@@ -1052,6 +1197,7 @@ function playerMove(i){
 
 /* ---------- MODE SWITCH ---------- */
 function switchMode(mode){
+  if(cam.active)stopCamera();
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   $('#view-'+mode).classList.add('active');
   document.querySelectorAll('.dial button').forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));
