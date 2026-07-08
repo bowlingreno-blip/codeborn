@@ -792,15 +792,27 @@ const store={
   }
 };
 let saveTimer=null;
+function serializeDex(){
+  const data={};
+  for(const [id,e] of Object.entries(state.dex))
+    data[id]={c:e.code, s:e.shinyCode||0, g:GRADES.indexOf(e.bestGrade), r:e.reinforce||0};
+  return JSON.stringify(data);
+}
 function saveGame(){ /* debounced */
   clearTimeout(saveTimer);
-  saveTimer=setTimeout(async()=>{
-    const data={};
-    for(const [id,e] of Object.entries(state.dex))
-      data[id]={c:e.code, s:e.shinyCode||0, g:GRADES.indexOf(e.bestGrade), r:e.reinforce||0};
-    try{ await store.set(SAVE_KEY, JSON.stringify(data)); }catch(e){ console.error('save failed',e); }
+  saveTimer=setTimeout(()=>{
+    try{ store.set(SAVE_KEY, serializeDex()); }catch(e){ console.error('save failed',e); }
   },250);
 }
+function flushSave(){ /* synchronous write, so a just-caught creature survives an immediate close/background */
+  clearTimeout(saveTimer);
+  const raw=serializeDex();
+  try{ localStorage.setItem(SAVE_KEY, raw); }catch(e){}
+  try{ store.set(SAVE_KEY, raw); }catch(e){} /* best-effort async mirror to window.storage */
+}
+/* Phones freeze JS timers when a tab is backgrounded/closed; flush pending saves on the way out. */
+window.addEventListener('pagehide',flushSave);
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') flushSave(); });
 async function loadGame(){
   try{
     const raw=await store.get(SAVE_KEY);
